@@ -1,0 +1,25 @@
+# Environment
+.env
+*.env
+__pycache__/
+*.pyc
+*.pyo
+
+# Data directories
+/data/
+*.log
+
+# Docker volumes
+postgres-data/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backup files
+*_backup.py
+*_broken.py

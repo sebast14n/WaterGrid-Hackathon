@@ -1,0 +1,13 @@
+services:
+  postgis:
+    image: postgis/postgis:16-3.4
+    container_name: siret-postgis
+    restart: always
+    environment:
+      POSTGRES_DB: siret
+      POSTGRES_USER: siret
+      POSTGRES_PASSWORD: STRONG_DB_PASSWORD
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./postgis/data:/var/lib/postgresql/data

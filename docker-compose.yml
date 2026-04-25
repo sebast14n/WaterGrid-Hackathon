@@ -1,0 +1,64 @@
+services:
+  redis:
+    image: redis:7
+    container_name: siret-redis
+    command: redis-server --appendonly yes --requirepass STRONG_PASSWORD
+    volumes:
+      - ./redis/data:/data
+    ports:
+      - "6379:6379"
+    restart: always
+
+  postgis:
+    image: postgis/postgis:16-3.4
+    container_name: siret-postgis
+    environment:
+      POSTGRES_DB: siret
+      POSTGRES_USER: siret
+      POSTGRES_PASSWORD: STRONG_DB_PASSWORD
+    volumes:
+      - ./postgis/data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    restart: always
+
+  api:
+    image: siret-backend:latest
+    container_name: siret-api
+    command: gunicorn --bind 0.0.0.0:8000 --workers 2 --timeout 120 app.api:app
+    environment:
+      - REDIS_URL=redis://:STRONG_PASSWORD@redis:6379/0
+      - DATABASE_URL=postgresql://siret:STRONG_DB_PASSWORD@postgis:5432/siret
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    volumes:
+      - /data/kmz_outputs:/data/kmz_outputs:ro
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      - postgis
+      - redis
+    restart: always
+
+  streamlit:
+    image: siret-backend:latest
+    container_name: siret-streamlit
+    command: >
+      streamlit run /app/streamlit/app.py
+      --server.port=8501
+      --server.address=0.0.0.0
+      --server.headless=true
+      --server.enableCORS=false
+      --server.enableXsrfProtection=false
+      --server.baseUrlPath=
+      --browser.gatherUsageStats=false
+    environment:
+      - WATERGRID_API_URL=http://api:8000/api
+    volumes:
+      - ./streamlit:/app/streamlit:ro
+      - /data/kmz_outputs:/data/kmz_outputs:ro
+      - /data/static:/data/static:ro
+    ports:
+      - "127.0.0.1:8501:8501"
+    depends_on:
+      - api
+    restart: always
