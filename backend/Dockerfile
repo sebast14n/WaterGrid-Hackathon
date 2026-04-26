@@ -36,3 +36,12 @@ WORKDIR /app
 COPY app /app/app
 
 CMD ["celery", "-A", "app.worker", "worker", "--loglevel=info"]
+
+# Add colleague's working dependencies
+RUN pip install --no-cache-dir \
+    geoai-py \
+    streamlit-folium \
+    folium \
+    planetary-computer \
+    pystac-client \
+    rioxarray

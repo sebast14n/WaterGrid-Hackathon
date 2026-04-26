@@ -1,489 +1,346 @@
 """
-Streamlit app for land change detection using geoai-py.
-- Sidebar: select year pair and trigger downloads / change detection
-- Map: interactive Leafmap/folium view of AOI + change overlay
-- Gallery: before / after / change images side by side
+WaterGrid - Monitoring Natura 2000 sites with Copernicus & Galileo
 """
 from __future__ import annotations
-
 import os
-import sys
-from pathlib import Path
-
+import requests
 import streamlit as st
 import folium
 from streamlit_folium import st_folium
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
-import calendar
+API_URL = os.getenv("WATERGRID_API_URL", "http://api:8000/api")
+KMZ_ID = 1
 
-from config import AOI_BBOX, YEARS, TIFF_DIR, CHANGE_DIR, get_aoi_geojson
-from download_images import download_year, download_month, download_all_months, MONTH_NAMES
-from land_change import run_change_detection
-from visualize import (
-    tif_to_rgb_png,
-    tif_to_ndvi_png,
-    make_timelapse_gif,
-    ndvi_timeseries_png,
-    diff_map_png,
+st.set_page_config(
+    page_title="WaterGrid - Natura 2000 Monitoring",
+    page_icon="🛰️",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-st.set_page_config(page_title="Land Change Detection", layout="wide")
-st.title("Land Change Detection — geoai + Planetary Computer")
-
-# ── Sidebar ──────────────────────────────────────────────────────────────────
-st.sidebar.header("Settings")
-
-year_options = YEARS
-year_before = st.sidebar.selectbox("Year (before)", year_options[:-1], index=0)
-year_after  = st.sidebar.selectbox("Year (after)",  year_options[1:],  index=0)
-
-overwrite = st.sidebar.checkbox("Re-download / re-run", value=False)
-
-if st.sidebar.button("1. Download imagery"):
-    with st.spinner(f"Downloading {year_before} ..."):
-        download_year(year_before, overwrite=overwrite)
-    with st.spinner(f"Downloading {year_after} ..."):
-        download_year(year_after, overwrite=overwrite)
-    st.sidebar.success("Download complete.")
-
-if st.sidebar.button("2. Run change detection"):
-    with st.spinner("Running ChangeStarDetection ..."):
-        run_change_detection(year_before, year_after, overwrite=overwrite)
-    st.sidebar.success("Change detection complete.")
-
-# ── Monthly download section ──────────────────────────────────────────────────
-st.sidebar.markdown("---")
-st.sidebar.subheader("Monthly Download")
-
-all_years = list(range(2017, 2026))   # Sentinel-2 L2A starts ~2017
-monthly_year = st.sidebar.selectbox("Year", all_years, index=all_years.index(2020))
-
-month_labels = [f"{i:02d} – {MONTH_NAMES[i-1]}" for i in range(1, 13)]
-selected_months_labels = st.sidebar.multiselect(
-    "Months (leave empty = all 12)",
-    month_labels,
-    default=[],
-)
-# Parse selected month numbers; default to all 12
-selected_months = (
-    [int(m.split(" – ")[0]) for m in selected_months_labels]
-    if selected_months_labels
-    else list(range(1, 13))
-)
-
-monthly_overwrite = st.sidebar.checkbox("Re-download monthly", value=False)
-
-if st.sidebar.button("Download monthly imagery"):
-    progress = st.sidebar.progress(0, text="Starting...")
-    results = []
-    for idx, month in enumerate(selected_months):
-        mm = calendar.month_abbr[month]
-        progress.progress((idx) / len(selected_months), text=f"Downloading {monthly_year}-{mm} ...")
-        p = download_month(monthly_year, month, overwrite=monthly_overwrite)
-        results.append((month, p))
-    progress.progress(1.0, text="Done!")
-    ok  = sum(1 for _, p in results if p)
-    fail = sum(1 for _, p in results if not p)
-    st.sidebar.success(f"Downloaded {ok}/{len(selected_months)} months.")
-    if fail:
-        st.sidebar.warning(f"{fail} month(s) had no scenes available.")
-
-# ── Map ───────────────────────────────────────────────────────────────────────
-st.subheader("AOI Map")
-
-center_lat = (AOI_BBOX[1] + AOI_BBOX[3]) / 2
-center_lon = (AOI_BBOX[0] + AOI_BBOX[2]) / 2
-
-# Basemap selector
-basemap_choice = st.sidebar.selectbox(
-    "Basemap",
-    ["Sentinel-2 Cloudless (Copernicus/EOX)", "OpenStreetMap", "Google Satellite"],
-    index=0,
-)
-
-BASEMAPS = {
-    "Sentinel-2 Cloudless (Copernicus/EOX)": {
-        "tiles": "https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2021_3857/default/g/{z}/{y}/{x}.jpg",
-        "attr": (
-            '&copy; <a href="https://s2maps.eu">Sentinel-2 cloudless – s2maps.eu</a> '
-            'by <a href="https://eox.at">EOX IT Services GmbH</a> '
-            '(Contains modified Copernicus Sentinel data 2021)'
-        ),
-    },
-    "OpenStreetMap": {
-        "tiles": "OpenStreetMap",
-        "attr": "&copy; OpenStreetMap contributors",
-    },
-    "Google Satellite": {
-        "tiles": "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
-        "attr": "Google Satellite",
-    },
+st.markdown("""
+<style>
+.main-header {
+    background: linear-gradient(135deg, #003399 0%, #1e3a8a 100%);
+    padding: 1.5rem;
+    border-radius: 8px;
+    color: white;
+    margin-bottom: 1rem;
 }
+.badge {
+    display: inline-block;
+    padding: 0.3rem 0.8rem;
+    background: #FFCC00;
+    color: #003399;
+    border-radius: 4px;
+    font-weight: bold;
+    font-size: 0.85rem;
+    margin-right: 0.5rem;
+}
+.alert-high { background: #fee2e2; border-left: 4px solid #dc2626; padding: 0.8rem; border-radius: 6px; margin: 0.3rem 0; }
+.alert-medium { background: #fef3c7; border-left: 4px solid #d97706; padding: 0.8rem; border-radius: 6px; margin: 0.3rem 0; }
+.alert-low { background: #dbeafe; border-left: 4px solid #2563eb; padding: 0.8rem; border-radius: 6px; margin: 0.3rem 0; }
+</style>
+""", unsafe_allow_html=True)
 
-bm = BASEMAPS[basemap_choice]
-m = folium.Map(
-    location=[center_lat, center_lon],
-    zoom_start=14,
-    tiles=bm["tiles"],
-    attr=bm["attr"],
+st.markdown("""
+<div class="main-header">
+    <span class="badge">🇪🇺 COPERNICUS</span>
+    <span class="badge">📡 GALILEO</span>
+    <span class="badge">🛰️ EGNOS</span>
+    <h1 style="margin: 0.5rem 0 0 0;">WaterGrid</h1>
+    <p style="margin: 0; opacity: 0.9;">Automated detection of anthropic disturbances in Natura 2000 protected sites</p>
+</div>
+""", unsafe_allow_html=True)
+
+
+@st.cache_data(ttl=60)
+def fetch_api(endpoint):
+    try:
+        r = requests.get(API_URL + endpoint, timeout=30)
+        if r.status_code == 200:
+            return r.json()
+        return None
+    except Exception as e:
+        st.error("API error: " + str(e))
+        return None
+
+
+def fetch_post(endpoint):
+    try:
+        r = requests.get(API_URL + endpoint, timeout=120)
+        if r.status_code == 200:
+            return r.json()
+        return None
+    except Exception as e:
+        st.error("API error: " + str(e))
+        return None
+
+
+st.sidebar.title("Controls")
+st.sidebar.markdown("---")
+
+aoi_info = fetch_api("/aoi/" + str(KMZ_ID))
+
+if aoi_info:
+    st.sidebar.markdown("**Site:** " + aoi_info['name'])
+    st.sidebar.markdown("**Area:** " + str(round(aoi_info['area_ha'], 1)) + " ha")
+    lat = aoi_info['centroid']['lat']
+    lon = aoi_info['centroid']['lon']
+    st.sidebar.markdown("**Center:** " + str(round(lat, 4)) + "°N, " + str(round(lon, 4)) + "°E")
+
+view_mode = st.sidebar.radio(
+    "View",
+    ["📊 Dashboard", "🗺️ Map & Imagery", "🚨 Alerts & Reports", "📹 Drone Evidence", "ℹ️ About"]
 )
 
-# Draw AOI polygon
-aoi_geojson = get_aoi_geojson()
-folium.GeoJson(
-    aoi_geojson,
-    name="AOI",
-    style_function=lambda _: {"color": "cyan", "weight": 2, "fillOpacity": 0},
-).add_to(m)
+st.sidebar.markdown("---")
+st.sidebar.markdown("**Powered by:**")
+st.sidebar.markdown("- ESA Copernicus Sentinel-2")
+st.sidebar.markdown("- Galileo GNSS (drone georef)")
+st.sidebar.markdown("- Anthropic Claude (LLM reports)")
 
-folium.LayerControl().add_to(m)
-st_folium(m, height=420, width="stretch")
 
-# ══ Tabs ══════════════════════════════════════════════════════════════════════
-tab_download, tab_visual, tab_gee, tab_files = st.tabs(
-    ["📥 Download status", "🎞️ Visualize", "🛰️ GEE Analysis", "📂 Files"]
-)
-
-# ── Tab 1: download status ─────────────────────────────────────────────────
-with tab_download:
-    st.subheader("Yearly imagery")
-    before_tif  = TIFF_DIR  / f"sentinel2_{year_before}.tif"
-    after_tif   = TIFF_DIR  / f"sentinel2_{year_after}.tif"
-    change_tif  = CHANGE_DIR / f"change_{year_before}_{year_after}.tif"
-    change_gpkg = CHANGE_DIR / f"change_{year_before}_{year_after}.gpkg"
-
-    cols = st.columns(3)
-    with cols[0]:
-        st.markdown(f"**Before ({year_before})**")
-        if before_tif.exists():
-            st.success(f"✓ `{before_tif.name}`")
-        else:
-            st.warning("Not downloaded yet.")
-    with cols[1]:
-        st.markdown(f"**After ({year_after})**")
-        if after_tif.exists():
-            st.success(f"✓ `{after_tif.name}`")
-        else:
-            st.warning("Not downloaded yet.")
-    with cols[2]:
-        st.markdown("**Change mask**")
-        if change_tif.exists():
-            st.success(f"✓ `{change_tif.name}`")
-            if change_gpkg.exists():
-                st.info(f"Vector: `{change_gpkg.name}`")
-        else:
-            st.warning("Not computed yet.")
-
+if view_mode == "📊 Dashboard":
+    monthly = fetch_api("/timeseries/" + str(KMZ_ID) + "/monthly")
+    alerts_data = fetch_api("/alerts/" + str(KMZ_ID))
+    timeseries_data = fetch_api("/timeseries/" + str(KMZ_ID))
+    
+    col1, col2, col3, col4 = st.columns(4)
+    
+    if aoi_info:
+        with col1:
+            st.metric("Monitored area", str(round(aoi_info['area_ha'])) + " ha")
+    
+    if timeseries_data:
+        with col2:
+            st.metric("Sentinel-2 scenes", timeseries_data['count'])
+    
+    if monthly:
+        n_months = len(monthly['monthly'])
+        with col3:
+            st.metric("Months analyzed", n_months)
+    
+    if alerts_data:
+        with col4:
+            n_alerts = alerts_data['total']
+            st.metric("Anomalies detected", n_alerts)
+    
     st.markdown("---")
-    st.subheader(f"Monthly imagery — {monthly_year}")
-    monthly_tifs = sorted(TIFF_DIR.glob(f"sentinel2_{monthly_year}_??.tif"))
-    if not monthly_tifs:
-        st.info("No monthly GeoTIFFs yet — use 'Download monthly imagery' in the sidebar.")
-    else:
-        cols = st.columns(4)
-        for i, tif in enumerate(monthly_tifs):
-            month_num = int(tif.stem.split("_")[-1])
-            label = f"{calendar.month_name[month_num]} {monthly_year}"
-            size_mb = tif.stat().st_size / 1e6
-            with cols[i % 4]:
-                st.success(f"**{label}**")
-                st.caption(f"{size_mb:.0f} MB")
-
-# ── Tab 2: Visualize ───────────────────────────────────────────────────────
-with tab_visual:
-    # ── Collect ALL available GeoTIFFs (yearly + monthly) ─────────────────
-    def _tif_label(p: Path) -> str:
-        """Human-readable label for any sentinel2_*.tif filename."""
-        parts = p.stem.split("_")   # ["sentinel2", YYYY] or ["sentinel2", YYYY, MM]
-        if len(parts) == 3:         # monthly
-            yr, mm = int(parts[1]), int(parts[2])
-            return f"{calendar.month_abbr[mm]} {yr}"
-        elif len(parts) == 2:       # yearly
-            return f"Year {parts[1]}"
-        return p.stem
-
-    all_tifs_raw = sorted(TIFF_DIR.glob("sentinel2_*.tif"))
-    # Build label → path mapping (deduplicated)
-    all_tifs_map: dict[str, Path] = {_tif_label(p): p for p in all_tifs_raw}
-    all_labels = list(all_tifs_map.keys())
-
-    # Let the user pick which images to include in visualizations
-    if all_tifs_raw:
-        selected_labels = st.multiselect(
-            "🗂️ Select images to visualize (default = all)",
-            all_labels,
-            default=all_labels,
-            key="viz_selector",
+    st.subheader("📈 Time series — 2 years of Sentinel-2 monitoring")
+    
+    if monthly and monthly['monthly']:
+        df = pd.DataFrame(monthly['monthly'])
+        
+        fig = make_subplots(
+            rows=2, cols=1,
+            subplot_titles=("Vegetation & Soil indicators (NDVI / BSI)", "Water surface (NDWI / Water %)"),
+            vertical_spacing=0.15,
+            specs=[[{"secondary_y": False}], [{"secondary_y": True}]]
         )
-    else:
-        selected_labels = []
-
-    all_monthly = [all_tifs_map[l] for l in selected_labels if l in all_tifs_map]
-
-    if not all_monthly:
-        st.info("No GeoTIFFs selected. Download some first or adjust the selector above.")
-    else:
-        viz_mode = st.radio(
-            "Visualization mode",
-            ["🖼️ Monthly RGB gallery",
-             "🌿 Monthly NDVI gallery",
-             "📈 NDVI time series",
-             "🎞️ Animated timelapse GIF",
-             "🔀 Before / After diff map"],
-            horizontal=False,
+        
+        fig.add_trace(
+            go.Scatter(x=df['month'], y=df['ndvi'], name='NDVI (vegetation)',
+                      line=dict(color='#22c55e', width=2.5), mode='lines+markers'),
+            row=1, col=1
         )
+        fig.add_trace(
+            go.Scatter(x=df['month'], y=df['bsi'], name='BSI (bare soil)',
+                      line=dict(color='#dc2626', width=2.5), mode='lines+markers'),
+            row=1, col=1
+        )
+        fig.add_trace(
+            go.Scatter(x=df['month'], y=df['ndwi'], name='NDWI (water signal)',
+                      line=dict(color='#0ea5e9', width=2.5), mode='lines+markers'),
+            row=2, col=1
+        )
+        fig.add_trace(
+            go.Bar(x=df['month'], y=df['water_pct'], name='Water surface %',
+                   marker_color='rgba(14, 165, 233, 0.3)'),
+            row=2, col=1, secondary_y=True
+        )
+        
+        fig.update_xaxes(tickangle=-45)
+        fig.update_layout(height=600, hovermode='x unified', showlegend=True,
+                         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
+        
+        st.plotly_chart(fig, use_container_width=True)
+    
+    st.markdown("---")
+    st.subheader("🎬 Visual evolution — monthly composite animation")
+    
+    anim = fetch_api("/animation/" + str(KMZ_ID))
+    if anim and anim.get('exists'):
+        col1, col2, col3 = st.columns([1, 2, 1])
+        with col2:
+            st.image(anim['url'], use_container_width=True)
+            if aoi_info:
+                st.caption("24 months of Sentinel-2 imagery — " + aoi_info['name'])
+    else:
+        st.info("Animation not yet generated.")
 
-        # ── RGB gallery ───────────────────────────────────────────────────
-        if viz_mode.startswith("🖼️"):
-            st.caption("Each image is cropped to the AOI bounding box.")
-            cols = st.columns(4)
-            for i, tif in enumerate(all_monthly):
-                label = _tif_label(tif)
-                with cols[i % 4]:
-                    with st.spinner(f"{label} ..."):
-                        try:
-                            png = tif_to_rgb_png(tif)
-                            st.image(png, caption=label, width="stretch")
-                        except Exception as e:
-                            st.error(f"{label}: {e}")
 
-        # ── NDVI gallery ──────────────────────────────────────────────────
-        elif viz_mode.startswith("🌿"):
-            st.caption("NDVI colourmap: green = healthy vegetation, red = bare/stressed.")
-            cols = st.columns(4)
-            for i, tif in enumerate(all_monthly):
-                label = _tif_label(tif)
-                with cols[i % 4]:
-                    with st.spinner(f"{label} ..."):
-                        try:
-                            png = tif_to_ndvi_png(tif)
-                            st.image(png, caption=label, width="stretch")
-                        except Exception as e:
-                            st.error(f"{label}: {e}")
+elif view_mode == "🗺️ Map & Imagery":
+    if aoi_info:
+        st.subheader("🗺️ Map — " + aoi_info['name'])
+        
+        m = folium.Map(
+            location=[aoi_info['centroid']['lat'], aoi_info['centroid']['lon']],
+            zoom_start=15,
+            tiles='https://tiles.maps.eox.at/wmts/1.0.0/s2cloudless-2021_3857/default/g/{z}/{y}/{x}.jpg',
+            attr='Sentinel-2 cloudless – s2maps.eu by EOX'
+        )
+        
+        folium.GeoJson(
+            aoi_info['geojson'],
+            name="Monitored zone",
+            style_function=lambda _: {"color": "#dc2626", "weight": 3, "fillColor": "#dc2626", "fillOpacity": 0.2}
+        ).add_to(m)
+        
+        folium.LayerControl().add_to(m)
+        st_folium(m, height=500, use_container_width=True)
+    
+    st.markdown("---")
+    st.subheader("🖼️ Sentinel-2 imagery — by month")
+    
+    images = fetch_api("/scene-images/" + str(KMZ_ID))
+    if images:
+        df_img = pd.DataFrame(images)
+        df_img['month'] = df_img['date'].str[:7]
+        best_per_month = df_img.sort_values('cloud_cover').groupby('month').first().reset_index()
+        best_per_month = best_per_month.sort_values('month')
+        
+        st.markdown("**" + str(len(best_per_month)) + " monthly composites** — best cloud-free scene per month")
+        
+        view_type = st.selectbox("Imagery type", ["RGB true color", "NDVI (vegetation)", "NDWI (water)"])
+        url_field = {"RGB true color": "rgb_url", "NDVI (vegetation)": "ndvi_url", "NDWI (water)": "ndwi_url"}[view_type]
+        
+        n_cols = 4
+        for i in range(0, len(best_per_month), n_cols):
+            cols = st.columns(n_cols)
+            for j, col in enumerate(cols):
+                if i + j < len(best_per_month):
+                    row = best_per_month.iloc[i + j]
+                    with col:
+                        if row[url_field]:
+                            st.image(row[url_field], caption=row['month'], use_container_width=True)
+                            caption = "NDVI: " + str(row['ndvi']) + " | BSI: " + str(row['bsi']) + " | Water: " + str(row['water_pct']) + "%"
+                            st.caption(caption)
 
-        # ── NDVI time series ──────────────────────────────────────────────
-        elif viz_mode.startswith("📈"):
-            st.caption("Mean NDVI across pixels in the AOI, plotted over time.")
-            with st.spinner("Computing NDVI for all months ..."):
-                labels = [_tif_label(p) for p in all_monthly]
-                try:
-                    chart_png = ndvi_timeseries_png(all_monthly, labels)
-                    st.image(chart_png, width="stretch")
-                except Exception as e:
-                    st.error(str(e))
 
-        # ── Timelapse GIF ─────────────────────────────────────────────────
-        elif viz_mode.startswith("🎞️"):
-            fps = st.slider("Frame speed (fps)", 0.5, 4.0, 1.5, 0.5)
-            if st.button("Generate timelapse GIF"):
-                with st.spinner("Rendering frames ..."):
-                    labels = [_tif_label(p) for p in all_monthly]
-                    try:
-                        gif = make_timelapse_gif(all_monthly, fps=fps, labels=labels)
-                        st.image(gif, caption="Sentinel-2 timelapse", width="stretch")
-                        st.download_button("⬇️ Download GIF", gif, "timelapse.gif", "image/gif")
-                    except Exception as e:
-                        st.error(str(e))
-            else:
-                st.info("Press 'Generate timelapse GIF' to build the animation.")
-
-        # ── Before / After diff map ───────────────────────────────────────
-        elif viz_mode.startswith("🔀"):
-            labels_map = {_tif_label(p): p for p in all_monthly}
-            label_list = list(labels_map.keys())
-            if len(label_list) < 2:
-                st.warning("Need at least 2 monthly GeoTIFFs to compare.")
-            else:
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    label_before = st.selectbox("Before", label_list, index=0)
-                with col_b:
-                    label_after  = st.selectbox("After",  label_list, index=min(1, len(label_list)-1))
-
-                if st.button("Compute difference"):
-                    if label_before == label_after:
-                        st.warning("Please select two different months.")
-                    else:
-                        with st.spinner("Computing NDVI difference ..."):
-                            try:
-                                png = diff_map_png(
-                                    labels_map[label_before],
-                                    labels_map[label_after],
-                                    label_before,
-                                    label_after,
-                                )
-                                st.image(png, width="stretch")
-                                st.caption(
-                                    "Left: RGB before | Middle: RGB after | "
-                                    "Right: NDVI change (green=vegetation gain, red=loss)"
-                                )
-                                st.download_button(
-                                    "⬇️ Download diff map",
-                                    png,
-                                    f"diff_{label_before}_{label_after}.png".replace(" ", "_"),
-                                    "image/png",
-                                )
-                            except Exception as e:
-                                st.error(str(e))
-
-# ── Tab 3: GEE Analysis ───────────────────────────────────────────────────
-with tab_gee:
-    st.subheader("🛰️ Google Earth Engine — Illegal Land Change Detection")
-    st.markdown("""
-    Uses **Sentinel-2 L2A** via Google Earth Engine with dual cloud masking
-    (SCL band + s2cloudless probability) to detect:
-
-    | Anomaly | Index | Threshold |
-    |---|---|---|
-    | 🔴 Mine / excavation | ΔBSI > +0.05 | New bare soil |
-    | 🟠 Vegetation loss | ΔNDVI < −0.10 | Forest clearing |
-    | 🟣 Waste / plastic | ΔPI > +0.15 | Spectral anomaly |
-    """)
-
-    gee_col1, gee_col2 = st.columns(2)
-    with gee_col1:
-        gee_year_before = st.selectbox("Before year", list(range(2019, 2026)), index=4, key="gee_before")
-    with gee_col2:
-        gee_year_after  = st.selectbox("After year",  list(range(2019, 2026)), index=5, key="gee_after")
-
-    gee_season_start = st.select_slider(
-        "Season start (MM-DD)", options=["03-01","04-01","05-01","06-01"], value="05-01"
-    )
-    gee_season_end = st.select_slider(
-        "Season end (MM-DD)", options=["08-31","09-30","10-31","11-30"], value="09-30"
-    )
-
-    gee_cloud_max      = st.slider("Max scene cloud cover (%)", 1, 30, 10)
-    gee_cloud_prob_thr = st.slider("s2cloudless pixel threshold", 10, 80, 40)
-    bsi_thr  = st.slider("BSI change threshold",   0.01, 0.20, 0.05, 0.01)
-    ndvi_thr = st.slider("NDVI loss threshold",   -0.30, -0.05, -0.10, 0.01)
-    pi_thr   = st.slider("Plastic index threshold", 0.05, 0.40, 0.15, 0.01)
-
-    if st.button("▶ Run GEE Analysis"):
-        try:
-            import ee, geemap
-
-            with st.spinner("Initialising Google Earth Engine ..."):
-                try:
-                    ee.Initialize(project="project-ult-60cf8")
-                except Exception:
-                    ee.Authenticate()
-                    ee.Initialize(project="project-ult-60cf8")
-
-            roi = ee.Geometry.BBox(
-                west=26.94418657349121, south=46.45436033015628,
-                east=27.00760413540865, north=46.65837577224148,
-            )
-
-            def _scl_mask(img):
-                scl = img.select("SCL")
-                bad = (scl.eq(0).Or(scl.eq(1)).Or(scl.eq(3))
-                          .Or(scl.eq(8)).Or(scl.eq(9))
-                          .Or(scl.eq(10)).Or(scl.eq(11)))
-                return img.updateMask(bad.Not())
-
-            def _build(year):
-                s2 = (
-                    ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-                    .filterBounds(roi)
-                    .filterDate(f"{year}-{gee_season_start}", f"{year}-{gee_season_end}")
-                    .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", gee_cloud_max))
-                )
-                cp = (
-                    ee.ImageCollection("COPERNICUS/S2_CLOUD_PROBABILITY")
-                    .filterBounds(roi)
-                    .filterDate(f"{year}-{gee_season_start}", f"{year}-{gee_season_end}")
-                )
-                joined = ee.ImageCollection(
-                    ee.Join.saveFirst("cp").apply(
-                        s2, cp,
-                        ee.Filter.equals(leftField="system:index", rightField="system:index"),
+elif view_mode == "🚨 Alerts & Reports":
+    st.subheader("🚨 Detected anomalies")
+    st.markdown("Anomalies flagged when monthly indices deviate (z-score > 1.0) from 12-month baseline.")
+    
+    alerts_data = fetch_api("/alerts/" + str(KMZ_ID))
+    
+    if alerts_data and alerts_data['alerts']:
+        for alert in alerts_data['alerts']:
+            sev = alert['severity']
+            css_class = "alert-" + sev
+            
+            html = '<div class="' + css_class + '"><strong>' + alert['month'] + '</strong> — Severity: ' + sev.upper()
+            html += ' (max z-score: ' + str(alert['max_z']) + ')<br>'
+            html += 'NDVI: ' + str(alert['ndvi']) + ' (z=' + str(alert['ndvi_z']) + ') | '
+            html += 'BSI: ' + str(alert['bsi']) + ' (z=' + str(alert['bsi_z']) + ') | '
+            html += 'NDWI: ' + str(alert['ndwi']) + ' (z=' + str(alert['ndwi_z']) + ')</div>'
+            st.markdown(html, unsafe_allow_html=True)
+            
+            col1, col2 = st.columns([3, 1])
+            with col2:
+                if st.button("📄 Generate report", key="report_" + alert['month']):
+                    with st.spinner("Generating official report via Claude..."):
+                        report = fetch_post("/alerts/" + str(KMZ_ID) + "/" + alert['month'] + "/report")
+                        if report:
+                            st.session_state["report_" + alert['month']] = report
+            
+            session_key = "report_" + alert['month']
+            if session_key in st.session_state:
+                rep = st.session_state[session_key]
+                with st.expander("📄 Official report — " + alert['month'], expanded=True):
+                    st.markdown(rep['report'])
+                    st.markdown("---")
+                    st.caption("Generated by Claude (Anthropic) — Data: " + rep['metadata']['data_source'])
+                    st.download_button(
+                        "Download as text",
+                        rep['report'],
+                        file_name="watergrid_report_" + alert['month'] + ".txt"
                     )
-                )
-                def mask(img):
-                    img = _scl_mask(img)
-                    prob = ee.Image(img.get("cp")).select("probability")
-                    return img.updateMask(prob.lt(gee_cloud_prob_thr))
-                return joined.map(mask).median().clip(roi)
+            
+            st.markdown("---")
+    else:
+        st.info("No anomalies detected with current thresholds.")
 
-            with st.spinner(f"Building {gee_year_before} composite ..."):
-                before = _build(gee_year_before)
-            with st.spinner(f"Building {gee_year_after} composite ..."):
-                after  = _build(gee_year_after)
 
-            # Indices
-            def bsi(img):
-                return (img.select("B11").add(img.select("B4"))
-                           .subtract(img.select("B8").add(img.select("B2")))
-                           .divide(img.select("B11").add(img.select("B4"))
-                                      .add(img.select("B8")).add(img.select("B2")))
-                           .rename("BSI"))
+elif view_mode == "📹 Drone Evidence":
+    st.subheader("📹 Ground truth — Drone footage")
+    st.markdown("""
+Drone footage validates satellite-detected anomalies on the ground.
+Drone position is georeferenced using **Galileo GNSS + EGNOS** for sub-metric accuracy.
+""")
+    
+    drone_dir = "/data/drone"
+    if os.path.exists(drone_dir):
+        videos = [f for f in os.listdir(drone_dir) if f.endswith('.mp4')]
+        if videos:
+            for video in sorted(videos):
+                title = video.replace('_', ' ').replace('.mp4', '').title()
+                st.markdown("**" + title + "**")
+                st.video("/drone/" + video)
+                st.markdown("---")
+        else:
+            st.warning("No drone videos yet. Add files to /data/drone/")
+    else:
+        st.warning("Drone directory not found.")
 
-            def ndvi(img):
-                return img.normalizedDifference(["B8", "B4"]).rename("NDVI")
 
-            def pi(img):
-                nir = img.select("B8"); swir2 = img.select("B12")
-                return nir.divide(nir.add(swir2)).rename("PI")
+elif view_mode == "ℹ️ About":
+    st.subheader("ℹ️ About WaterGrid")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("""
+### The problem
 
-            d_bsi  = bsi(after).subtract(bsi(before)).rename("dBSI")
-            d_ndvi = ndvi(after).subtract(ndvi(before)).rename("dNDVI")
-            d_pi   = pi(after).subtract(pi(before)).rename("dPI")
+Romania has 600+ Natura 2000 sites covering ~23% of the country.
+These protected ecosystems are increasingly under pressure from illegal activities:
 
-            excav = d_bsi.gt(bsi_thr).selfMask()
-            vloss = d_ndvi.lt(ndvi_thr).And(d_bsi.gt(0)).selfMask()
-            water = after.normalizedDifference(["B3", "B8"]).gt(0.1)
-            waste = d_pi.gt(pi_thr).And(water.Not()).selfMask()
+- 🏗️ Unauthorized aggregate extraction (balastiere)
+- 🗑️ Construction debris dumping
+- 💧 River bed alteration
 
-            with st.spinner("Building interactive map ..."):
-                # Use plain folium with GEE tile URLs — no Jupyter kernel needed
-                def _tile(img, vis):
-                    vis_str = {k: ",".join(v) if isinstance(v, list) else str(v)
-                               for k, v in vis.items()}
-                    map_id = ee.data.getMapId({**vis_str, "image": img})
-                    return map_id["tile_fetcher"].url_format
+Authorities cannot physically monitor every site.
+Field inspections happen rarely.
 
-                fmap = folium.Map(
-                    location=[46.556, 26.976], zoom_start=11,
-                    tiles="https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
-                    attr="Google Satellite",
-                )
-                layers = [
-                    (after,  {"bands":"B4,B3,B2","min":"0","max":"3000","gamma":"1.4"}, f"RGB {gee_year_after}", True),
-                    (before, {"bands":"B4,B3,B2","min":"0","max":"3000","gamma":"1.4"}, f"RGB {gee_year_before}", False),
-                    (d_bsi,  {"min":"-0.2","max":"0.2","palette":"#1a9641,#ffffbf,#d7191c"}, "ΔBSI", True),
-                    (d_ndvi, {"min":"-0.4","max":"0.4","palette":"#d7191c,#ffffbf,#1a9641"}, "ΔNDVI", False),
-                    (excav,  {"palette":"#FF0000"}, "🔴 Excavation / Mine", True),
-                    (vloss,  {"palette":"#FF8C00"}, "🟠 Vegetation Loss", True),
-                    (waste,  {"palette":"#800080"}, "🟣 Waste Anomaly", True),
-                ]
-                for img, vis, name, show in layers:
-                    folium.TileLayer(
-                        tiles=_tile(img, vis), attr="GEE",
-                        name=name, overlay=True, control=True, show=show,
-                    ).add_to(fmap)
-                folium.LayerControl(collapsed=False).add_to(fmap)
-                out_html = Path("outputs/change") / f"gee_{gee_year_before}_{gee_year_after}.html"
-                fmap.save(str(out_html))
+### Our solution
 
-            st.success(f"Analysis complete — {gee_year_before} → {gee_year_after}")
-            with open(out_html) as f:
-                st.components.v1.html(f.read(), height=600, scrolling=True)
+WaterGrid uses **only public European space infrastructure** to provide
+continuous, automated monitoring of protected sites.
+""")
+    
+    with col2:
+        st.markdown("""
+### European data sources
 
-            st.download_button("⬇️ Download interactive map", open(out_html).read(),
-                               out_html.name, "text/html")
+🛰️ **Copernicus Sentinel-2**
+Optical imagery, 10m resolution, 5-day revisit.
 
-        except ImportError:
-            st.error("Install dependencies: `pip install earthengine-api geemap`")
-        except Exception as exc:
-            st.error(f"GEE error: {exc}")
-            st.info("Make sure you have run `earthengine authenticate` and have a valid GEE project.")
+📡 **Galileo GNSS**
+Drone georeferencing for ground-truth validation.
 
-# ── Tab 4: Files ───────────────────────────────────────────────────────────
-with tab_files:
-    tiffs   = sorted(TIFF_DIR.glob("sentinel2_*.tif"))
-    changes = sorted(CHANGE_DIR.glob("change_*.tif"))
-    for f in tiffs + changes:
-        size_mb = f.stat().st_size / 1e6
-        st.text(f"{f.name}  ({size_mb:.1f} MB)")
+🛰️ **EGNOS**
+Augmentation system for accuracy.
 
+🤖 **Anthropic Claude**
+LLM-generated official reports.
+
+### Pilot site
+
+ROSCI0434 - Siretul Mijlociu
+~30 km² of riverbank ecosystem
+33 ha around documented illegal balastiera
+""")

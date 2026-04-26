@@ -1,0 +1,7 @@
+geoai-py
+streamlit
+streamlit-folium
+folium
+planetary-computer
+pystac-client
+rioxarray

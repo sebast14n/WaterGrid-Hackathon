@@ -54,7 +54,7 @@ services:
     environment:
       - WATERGRID_API_URL=http://api:8000/api
     volumes:
-      - ./streamlit:/app/streamlit:ro
+      - ./streamlit:/app/streamlit
       - /data/kmz_outputs:/data/kmz_outputs:ro
       - /data/static:/data/static:ro
     ports:
