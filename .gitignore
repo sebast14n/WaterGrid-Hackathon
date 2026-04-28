@@ -23,3 +23,8 @@ Thumbs.db
 # Backup files
 *_backup.py
 *_broken.py
+postgis/data/
+redis/data/
+uptime-kuma/
+*.backup
+coleg_imports.txt
